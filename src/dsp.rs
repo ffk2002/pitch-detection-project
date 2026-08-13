@@ -56,7 +56,7 @@ impl FftProcessor{
             // let (bin, _mag) = spectrum[1..self.window_size/2].iter().enumerate()
             //             .max_by(|(_, a), (_,b)| a.norm().partial_cmp(&b.norm()).unwrap())?;
 
-            let bin = self.suppressions(&spectrum).unwrap() +1;
+            let bin = self.suppressions(&spectrum)?;
 
             // the index of the bin containing the freq map
             Some((bin as f32)*self.sample_rate/(self.window_size as f32))
