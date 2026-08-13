@@ -41,10 +41,15 @@ fn capture_thread(mut producer: impl Producer<Item = f32> + Send + 'static){
     let host                        = cpal::default_host();
     let device                      = host.default_input_device().expect("no input found");
     let stream_config: StreamConfig = device.default_input_config().expect("no default input config").into();
-    
+    let stream_channels: usize             = stream_config.channels as usize;
+
     let stream = device.build_input_stream(
         stream_config, 
-        move |clip: &[f32], _: &InputCallbackInfo| { producer.push_slice(clip);},
+        move |clip: &[f32], _: &InputCallbackInfo| { 
+            producer.push_iter(
+                clip.chunks(stream_channels).map(|f| f.iter().sum::<f32>()/stream_channels as f32)
+            );
+        },
         |err| eprintln!("istream err: {err}"),
         None,
     ).expect("failed to build input stream");
