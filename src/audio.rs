@@ -47,6 +47,10 @@ fn capture_thread(mut producer: impl Producer<Item = f32> + Send + 'static){
         stream_config, 
         move |clip: &[f32], _: &InputCallbackInfo| { 
             producer.push_iter(
+                //audio is captured in stereo format - [L0, R0, L1, R1, L2, R2]
+                // average every pair of readings and send to processor thread 
+                //solves halving of freq readings because buffer sent is 96000 samples
+                //even though the bins are calculated with 48000 hz
                 clip.chunks(stream_channels).map(|f| f.iter().sum::<f32>()/stream_channels as f32)
             );
         },
@@ -92,6 +96,7 @@ fn processer_thread(mut consumer: impl Consumer<Item = f32>, sample_rate: f32){
             // }
 
             match freq {
+                // validation/debugging
                 Some(freq) => writeln!(writer, "{rms:.4},{db:.4},{freq:.2}"),
                 None => writeln!(writer, "{rms:.4},{db:.4},"),
             }.expect("failed to write csv row");

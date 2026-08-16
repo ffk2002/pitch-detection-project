@@ -17,8 +17,7 @@ pub struct FftProcessor{
     planner     : FftPlanner<f32>,
 }
 
-
-const NOISE_FLOOR_MULT: f32 = 3.0;
+const NOISE_FLOOR_MULT: f32 = 2.0;
 
 impl FftProcessor{
 
@@ -51,15 +50,21 @@ impl FftProcessor{
             let fft = self.planner.plan_fft_forward(self.window_size);
             fft.process(&mut spectrum);
 
+            //apply suppressions to smooth out noise and pick highest energy bin
+            // sample rate/window size = bin width
+            //=48000/2048 = 23.4hz/bin
+            let bin = self.suppressions(&spectrum)?+1;
 
-            //get freq with max energy
-            // let (bin, _mag) = spectrum[1..self.window_size/2].iter().enumerate()
-            //             .max_by(|(_, a), (_,b)| a.norm().partial_cmp(&b.norm()).unwrap())?;
-
-            let bin = self.suppressions(&spectrum)?;
+            //calculate parabolic interpolation on discrete bin idxs
+            //bins are 23.4Hz apart, and only return in discrete multiples
+            //ex: input 110hz will return bin 5 (117.2Hz) as that is the closest
+            // bin prediction
+            //solutions: narrower bins or guess offset (parabolic interpolation)
+            //source: cluade and indian guy on youtube
+            let guess = self.peak_interpolation(bin, &spectrum);
 
             // the index of the bin containing the freq map
-            Some((bin as f32)*self.sample_rate/(self.window_size as f32))
+            Some((guess? as f32)*self.sample_rate/(self.window_size as f32))
         }
     }
 
@@ -89,5 +94,20 @@ impl FftProcessor{
 
 
         Some(peak_bin)
+    }
+
+    pub fn peak_interpolation(&mut self, bin: usize, spectrum: &Vec<Complex32>) -> Option<f32> {
+        let mags = |i: usize| spectrum[i].norm();
+
+        let a = mags(bin-1);
+        let b = mags(bin);
+        let c = mags(bin+1);
+        let den = a-2.0*b+c;
+        if den == 0.0{
+            return Some(0.0);
+        }
+        let offset = 0.5*(a-c)/den;
+
+        return Some(bin as f32+offset);
     }
 }
