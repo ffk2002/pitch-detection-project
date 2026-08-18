@@ -1,4 +1,4 @@
-# piano-project
+# pitch-detection-project
 
 Real-time pitch detection from microphone input, written in Rust.
 
