@@ -38,9 +38,9 @@ pub fn run(){
 //simple thread to capture readings from the mic and send to audio and processing layers
 //avoid allocation for real time audio capture reliability
 fn capture_thread(mut producer: impl Producer<Item = f32> + Send + 'static){
-    let host                        = cpal::default_host();
-    let device                      = host.default_input_device().expect("no input found");
-    let stream_config: StreamConfig = device.default_input_config().expect("no default input config").into();
+    let host                               = cpal::default_host();
+    let device                             = host.default_input_device().expect("no input found");
+    let stream_config: StreamConfig        = device.default_input_config().expect("no default input config").into();
     let stream_channels: usize             = stream_config.channels as usize;
 
     let stream = device.build_input_stream(
@@ -68,7 +68,7 @@ fn capture_thread(mut producer: impl Producer<Item = f32> + Send + 'static){
 
 
 fn processer_thread(mut consumer: impl Consumer<Item = f32>, sample_rate: f32){
-    let window: Vec<f32> = (0..FFT_WINDOW_SIZE).map(|i| 0.5 - 0.5*(2.0 * std::f32::consts::PI*i as f32/(FFT_WINDOW_SIZE as f32-1.0)).cos()).collect();
+    let window     = dsp::hann_window(FFT_WINDOW_SIZE);
     let mut fft    = dsp::FftProcessor::new(window, sample_rate, FFT_WINDOW_SIZE);
     let file       = File::create(READINGS_CSV_PATH).expect("failed to create readings csv");
     let mut writer = BufWriter::new(file);
