@@ -18,6 +18,11 @@ pub struct FftProcessor{
 }
 
 const NOISE_FLOOR_MULT: f32 = 2.0;
+//cap on how many peaks (potential simultaneous notes + overtones) to return per window
+const MAX_PEAKS: usize = 6;
+//peaks closer than this many bins to a stronger accepted peak are treated as
+//sidelobes/leakage of the same note rather than a distinct pitch
+const MIN_PEAK_SEPARATION_BINS: usize = 2;
 
 //generates a Hann window of the given size for use with FftProcessor::new
 pub fn hann_window(size: usize) -> Vec<f32> {
@@ -41,75 +46,93 @@ impl FftProcessor{
     //from the samples collected, populate buffer and send to fft planner when full
     //when fft returns magnitudes of the frequencies, use it to find the frequency with the highest
     // energy which will correspond to the pitch
-    pub fn collect_and_process(&mut self, samples: &[f32]) -> Option<f32> {
+    pub fn _collect_and_process(&mut self, samples: &[f32]) -> Option<f32> {
+        //the dominant frequency is the strongest peak, which multi returns first
+        self.collect_and_process_multi(samples)
+            .and_then(|freqs| freqs.first().copied())
+    }
+
+    //same as collect_and_process, but returns every spectral peak passing the
+    //noise floor, strongest first - needed for chord detection where several
+    //notes sound at once
+    //returns None while the window is still filling, Some(vec) once processed
+    // (empty vec when nothing passed the noise floor)
+    pub fn collect_and_process_multi(&mut self, samples: &[f32]) -> Option<Vec<f32>> {
         self.buff.extend_from_slice(samples);
 
         //buffer is not yet full
         if self.buff.len()<self.window_size{
             return None;
-        }else{
-            //apply hann window to smooth edges of the window
-            //create spectrum array of complex vals 
-            let mut spectrum: Vec<Complex32> = std::iter::zip(&self.hann, &self.buff[..self.window_size])
-                .map(|(&w, &s)| Complex32::new(w * s, 0.0))
-                .collect();
-            self.buff.drain(..self.window_size);
-            let fft = self.planner.plan_fft_forward(self.window_size);
-            fft.process(&mut spectrum);
-
-            //apply suppressions to smooth out noise and pick highest energy bin
-            // sample rate/window size = bin width
-            //=48000/2048 = 23.4hz/bin
-            let bin = self.suppressions(&spectrum)?+1;
-
-            //calculate parabolic interpolation on discrete bin idxs
-            //bins are 23.4Hz apart, and only return in discrete multiples
-            //ex: input 110hz will return bin 5 (117.2Hz) as that is the closest
-            // bin prediction
-            //solutions: narrower bins or guess offset (parabolic interpolation)
-            //source: cluade and indian guy on youtube
-            let guess = self.peak_interpolation(bin, &spectrum);
-
-            // the index of the bin containing the freq map
-            Some((guess? as f32)*self.sample_rate/(self.window_size as f32))
         }
+
+        //apply hann window to smooth edges of the window
+        //create spectrum array of complex vals
+        let mut spectrum: Vec<Complex32> = std::iter::zip(&self.hann, &self.buff[..self.window_size])
+            .map(|(&w, &s)| Complex32::new(w * s, 0.0))
+            .collect();
+        self.buff.drain(..self.window_size);
+        let fft = self.planner.plan_fft_forward(self.window_size);
+        fft.process(&mut spectrum);
+
+        //find local maxima passing the noise floor, strongest first
+        // sample rate/window size = bin width
+        //=48000/2048 = 23.4hz/bin
+        let peaks = self.find_peaks(&spectrum);
+
+        //calculate parabolic interpolation on discrete bin idxs
+        //bins are 23.4Hz apart, and only return in discrete multiples
+        //ex: input 110hz will return bin 5 (117.2Hz) as that is the closest
+        // bin prediction
+        //solutions: narrower bins or guess offset (parabolic interpolation)
+        //source: cluade and indian guy on youtube
+        let freqs = peaks.iter()
+            .filter_map(|&bin| self.peak_interpolation(bin, &spectrum))
+            .map(|guess| guess*self.sample_rate/(self.window_size as f32))
+            .collect();
+
+        Some(freqs)
     }
 
 
-    //used to suppress background noises with enough energy to dominate over notes
-    pub fn suppressions(&mut self, spectrum: &Vec<Complex32>) -> Option<usize> {
-        //find peak bin and mag
-        let area = &spectrum[1..self.window_size/2];
-        let mut peak_bin = 0usize;
-        let mut peak_mag = 0.0f32;
-        let mut mag_sum = 0.0f32;
+    //finds local maxs in spectrum that pass the noise floor test,
+    //returned strongest first; peaks closer than MIN_PEAK_SEPARATION_BINS to an
+    //already accepted (stronger) peak are skipped as sidelobes of the same note
+    fn find_peaks(&self, spectrum: &[Complex32]) -> Vec<usize> {
+        let half = self.window_size/2;
 
-        for (i, c) in area.iter().enumerate() {
-            let mag = c.norm();
-            mag_sum+=mag;
-            if mag > peak_mag {
-                peak_mag=mag;
-                peak_bin=i;
+        //avg energy of the analysis area for the noise floor test;
+
+        let mag_sum: f32 = spectrum[1..half].iter().map(|c| c.norm()).sum();
+        let avg_energy   = mag_sum/(half-1) as f32;
+        let floor        = (avg_energy*NOISE_FLOOR_MULT).max(1e-9);
+
+        //local maxima above the noise floor; bins 2..half-1 for range in 
+        // parabolic interp fn
+        let mut candidates: Vec<(usize, f32)> = (2..half-1)
+            .filter_map(|i| {
+                let mag = spectrum[i].norm();
+                let is_peak = mag > spectrum[i-1].norm() && mag >= spectrum[i+1].norm();
+                (is_peak && mag > floor).then_some((i, mag))
+            })
+            .collect();
+
+        //strongest first, then greedily accept peaks far enough from accepted ones
+        candidates.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap());
+
+        let mut peaks: Vec<usize> = Vec::new();
+        for (bin, _mag) in candidates {
+            if peaks.len() >= MAX_PEAKS {
+                break;
             }
-
-        }
-        //reject a flat/silent spectrum outright - avg_energy is 0 there, which would
-        //otherwise trivially satisfy the ratio check below (0.0 < 0.0 is false)
-        if peak_mag <= 1e-9 {
-            return None
+            if peaks.iter().all(|&p| bin.abs_diff(p) >= MIN_PEAK_SEPARATION_BINS) {
+                peaks.push(bin);
+            }
         }
 
-        //then check to see if it passes noise floor test; energy > than floor*multiplier
-        let avg_energy = mag_sum/area.len() as f32;
-        if peak_mag < avg_energy*NOISE_FLOOR_MULT{
-            return None
-        }
-
-
-        Some(peak_bin)
+        peaks
     }
 
-    pub fn peak_interpolation(&mut self, bin: usize, spectrum: &Vec<Complex32>) -> Option<f32> {
+    pub fn peak_interpolation(&self, bin: usize, spectrum: &[Complex32]) -> Option<f32> {
         //interpolate over log-magnitude rather than raw magnitude - a Hann window's
         //mainlobe is close to parabolic on a log scale, but not on a linear one, so
         //fitting the parabola directly to magnitude leaves a systematic bias
@@ -121,7 +144,7 @@ impl FftProcessor{
         let c = mags(bin+1);
         let den = a-2.0*b+c;
         if den == 0.0{
-            return Some(0.0);
+            return Some(bin as f32);
         }
         let offset = 0.5*(a-c)/den;
 
@@ -215,6 +238,33 @@ mod tests {
         assert!(
             (detected - 440.0).abs() < TOLERANCE_HZ,
             "expected ~440 Hz, got {detected}"
+        );
+    }
+
+    #[test]
+    fn detects_c_major_chord() {
+        // C4 + E4 + G4 played simultaneously; multi should surface all three
+        // peaks, which map to midi notes 60/64/67 and identify as Cmaj
+        let mut fft = processor();
+        let samples: Vec<f32> = (0..WINDOW_SIZE)
+            .map(|i| {
+                let t = i as f32 / SAMPLE_RATE;
+                let two_pi = 2.0 * std::f32::consts::PI;
+                ((two_pi * 261.63 * t).sin()
+                    + (two_pi * 329.63 * t).sin()
+                    + (two_pi * 392.0 * t).sin())
+                    / 3.0
+            })
+            .collect();
+
+        let freqs = fft
+            .collect_and_process_multi(&samples)
+            .expect("expected a processed window");
+        let notes = crate::midi::freqs_to_notes(&freqs);
+        assert_eq!(notes, vec![60, 64, 67], "freqs were {freqs:?}");
+        assert_eq!(
+            crate::midi::identify_chord(&notes).as_deref(),
+            Some("Cmaj")
         );
     }
 

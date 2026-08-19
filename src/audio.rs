@@ -1,4 +1,5 @@
 use crate::dsp;
+use crate::midi;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{InputCallbackInfo, StreamConfig};
@@ -72,7 +73,7 @@ fn processer_thread(mut consumer: impl Consumer<Item = f32>, sample_rate: f32){
     let mut fft    = dsp::FftProcessor::new(window, sample_rate, FFT_WINDOW_SIZE);
     let file       = File::create(READINGS_CSV_PATH).expect("failed to create readings csv");
     let mut writer = BufWriter::new(file);
-    writeln!(writer, "amplitude,db,freq_hz").expect("failed to write csv header");
+    writeln!(writer, "amplitude,db,freq_hz,notes,chord").expect("failed to write csv header");
 
     loop{
         let mut batch = Vec::new();
@@ -89,16 +90,28 @@ fn processer_thread(mut consumer: impl Consumer<Item = f32>, sample_rate: f32){
             let db      = 20.0*rms.max(1e-12).log10();
 
             // only Some() once every FFT_WINDOW_SIZE samples have accumulated;
-            // most rows leave this column blank in the csv
-            let freq = fft.collect_and_process(&batch);
-            // if let Some(freq) = freq {
-            //     println!("dominant freq: {freq:.2} Hz");
-            // }
+            // most rows leave these columns blank in the csv
+            let freqs = fft.collect_and_process_multi(&batch);
 
-            match freq {
-                // validation/debugging
-                Some(freq) => writeln!(writer, "{rms:.4},{db:.4},{freq:.2}"),
-                None => writeln!(writer, "{rms:.4},{db:.4},"),
+            match freqs.as_deref() {
+                Some(freqs) if !freqs.is_empty() => {
+                    // strongest peak first = dominant frequency
+                    let dominant = freqs[0];
+                    // suppress overtones, map to midi, then match chord shape
+                    let notes    = midi::freqs_to_notes(freqs);
+                    let names    = notes.iter()
+                                    .map(|&n| midi::midi_note_name(n))
+                                    .collect::<Vec<_>>()
+                                    .join(";"); //semicolons so the csv columns stay intact
+                    let chord    = midi::identify_chord(&notes).unwrap_or_default();
+
+                    if !chord.is_empty() {
+                        println!("chord: {chord} ({names})");
+                    }
+
+                    writeln!(writer, "{rms:.4},{db:.4},{dominant:.2},{names},{chord}")
+                }
+                _ => writeln!(writer, "{rms:.4},{db:.4},,,"),
             }.expect("failed to write csv row");
             writer.flush().expect("failed to flush readings csv");
         }

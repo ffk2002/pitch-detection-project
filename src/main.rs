@@ -1,5 +1,6 @@
 mod audio;
 mod dsp;
+mod midi;
 
 use std::thread;
 
